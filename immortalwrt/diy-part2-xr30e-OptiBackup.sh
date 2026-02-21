@@ -116,11 +116,84 @@ EOF
 
 # --- 4. 系统内核优化 (全量对齐) ---
 
-# A. 强制开启内核的 CPU 频率调节器并锁定高性能模式
+ #!/bin/bash
+
+# =========================================================
+# 2. 内核引擎合闸：PPE + WED + ZSTD
+# =========================================================
+KERNEL_CONF="target/linux/mediatek/filogic/config-6.6"
+cat >> $KERNEL_CONF <<EOF
+CONFIG_NET_MEDIATEK_SOC_WED=y
+CONFIG_NET_MEDIATEK_SOC_PPE=y
+CONFIG_ZRAM=y
+CONFIG_ZRAM_DEF_COMP_ZSTD=y
+CONFIG_RCU_NOCB_CPU=y
+CONFIG_RCU_NOCB_CPU_ALL=y
+EOF
+
+# =========================================================
+# 3. 注入 SMP 亲和性重构脚本 (核心 DIY2 逻辑)
+# =========================================================
+mkdir -p package/base-files/files/etc/init.d
+cat > package/base-files/files/etc/init.d/smp_optimize <<EOF
+#!/bin/sh /etc/rc.common
+START=99
+
+boot() {
+    # 强制开启高性能调度
+    echo "performance" > /sys/devices/system/cpu/cpufreq/policy0/scaling_governor 2>/dev/null
+
+    # 识别 IRQ
+    ETH_IRQ=\$(grep "mtk-network" /proc/interrupts | cut -d: -f1 | tr -d ' ')
+    WED_IRQ=\$(grep "mtk_wed" /proc/interrupts | cut -d: -f1 | tr -d ' ')
+    CRYPTO_IRQ=\$(grep "safexcel" /proc/interrupts | awk -F: '{print \$1}' | tr -d ' ')
+
+    # Core 0 (Mask 1): 基础网络中断与 WED
+    for irq in \$ETH_IRQ \$WED_IRQ; do
+        echo "1" > "/proc/irq/\$irq/smp_affinity"
+    done
+
+    # Core 1 (Mask 2): 加解密引擎
+    for irq in \$CRYPTO_IRQ; do
+        echo "2" > "/proc/irq/\$irq/smp_affinity"
+    done
+
+    # RPS 软跟随：网卡收包 Core 0 -> 协议栈处理 Core 1
+    for x in /sys/class/net/eth*/queues/rx-*/rps_cpus; do echo "2" > "\$x"; done
+    
+    # 提升内核 RFS 预算对位 2.5G 暴量
+    echo "32768" > /proc/sys/net/core/rps_sock_flow_entries
+    for x in /sys/class/net/eth*/queues/rx-*/rps_flow_cnt; do echo "4096" > "\$x"; done
+
+    # PPE 硬件全开
+    echo 1 > /sys/kernel/debug/hnat/all_external 2>/dev/null
+    echo 1 > /sys/kernel/debug/hnat/all_internal 2>/dev/null
+}
+EOF
+
+chmod +x package/base-files/files/etc/init.d/smp_optimize
+
+# =========================================================
+# 4. 编译资产收束
+# =========================================================
+sed -i "s/DISTRIB_DESCRIPTION='.*'/DISTRIB_DESCRIPTION='ImmortalWrt-MT7981-SMP-Turbo-v1.0'/g" package/base-files/files/etc/openwrt_release
+./scripts/feeds update -a && ./scripts/feeds install -a
+make defconfig
+chmod +x package/base-files/files/etc/init.d/rps_optimize
+# 物理合闸：加入开机自启
+ln -sf ../init.d/rps_optimize package/base-files/files/etc/rc.d/S99rps_optimize
+
+# 1. 物理主权：MT7981 1.6GHz 频率释放 ---
+
+# a. 修改设备树，将默认频率改为 1.65G (1650MHz)
+# 针对大部分 MT7981 源码结构，直接替换频率定义
+find target/linux/mediatek/files-6.6/arch/arm64/boot/dts/mediatek/ -name "*.dts*" | xargs sed -i 's/1300000/1650000/g' 2>/dev/null
+
+# b. 强制开启内核的 CPU 频率调节器并锁定高性能模式
 echo "CONFIG_CPU_FREQ_DEFAULT_GOV_PERFORMANCE=y" >> .config
 echo "CONFIG_CPU_FREQ_GOV_PERFORMANCE=y" >> .config
 
-# B.统一注入 sysctl 参数 (BBR + 调度优化)
+# c.统一注入 sysctl 参数 (BBR + 调度优化)
 cat >> package/base-files/files/etc/sysctl.conf <<EOF
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
@@ -128,7 +201,7 @@ vm.vfs_cache_pressure=40
 vm.min_free_kbytes=20480
 EOF
 
-# C.[ 内核调度调优：针对 A53 1.6&2.3GHz 优化 缩短调度周期，匹配高频心跳，降低 Hy2 延迟|[网络吞吐优化] 提高软中断处理预算 ]
+# d.[ 内核调度调优：针对 A53 1.6&2.3GHz 优化 缩短调度周期，匹配高频心跳，降低 Hy2 延迟|[网络吞吐优化] 提高软中断处理预算 ]
 # 使用 append 模式写入 sysctl.conf
 cat << 'EOF' >> package/base-files/files/etc/sysctl.conf
 kernel.sched_latency_ns=8000000
@@ -138,7 +211,7 @@ net.core.netdev_budget=1000
 net.core.netdev_budget_usecs=10000
 EOF
 
-# D.物理 HNAT (PPE) 开启逻辑注入
+# e.物理 HNAT (PPE) 开启逻辑注入
 sed -i '/exit 0/i \
 sysctl -w net.netfilter.nf_flow_table_hw=1 \
 for i in /sys/devices/system/cpu/cpufreq/policy*; do echo performance > "$i/scaling_governor"; done \
@@ -146,7 +219,7 @@ modprobe crypto_safexcel 2>/dev/null' package/base-files/files/etc/rc.local
 
 # --- 5. 分机型适配与配置固化 ---
 
-# a. 分机型精准调优逻辑 (解决 eMMC 波动与 NAND 压榨) ---
+# A. 分机型精准调优逻辑 (解决 eMMC 波动与 NAND 压榨) ---
 
 if grep -iq "rax3000m-emmc\|xr30-emmc" .config; then
     # 【eMMC 狂暴适配版】针对超频后的 I/O 瓶颈优化
@@ -176,17 +249,26 @@ elif grep -iq "tr3000v1" .config; then
     echo "kernel.nmi_watchdog=0" >> package/base-files/files/etc/sysctl.conf
 fi
 
-# b. 物理级性能解锁 (通用) ---
+# B. 物理级性能解锁 (通用) ---
 # 开启内核 RCU 卸载，减少系统琐事对高频核心的打扰
 echo "kernel.rcu_nocb_poll=1" >> package/base-files/files/etc/sysctl.conf
-# 根据 .config 自动检测并删除冗余监控插件 (清理内耗)
+
+# C.根据 .config 自动检测并删除冗余监控插件 (清理内耗)
 sed -i 's/CONFIG_PACKAGE_luci-app-turboacc=y/CONFIG_PACKAGE_luci-app-turboacc=n/g' .config
 sed -i 's/CONFIG_PACKAGE_wrtbwmon=y/CONFIG_PACKAGE_wrtbwmon=n/g' .config
 
-# c.拷贝自定义 DIY 目录 (如果存在)
+# D.拷贝自定义 DIY 目录 (如果存在)
 [ -d "${GITHUB_WORKSPACE}/immortalwrt/diy" ] && cp -Rf ${GITHUB_WORKSPACE}/immortalwrt/diy/* .
 
 # 最后的逻辑收束
+
+# 确保硬件加速模块入库
+cat >> .config <<EOF
+CONFIG_PACKAGE_kmod-crypto-hw-safexcel=y
+CONFIG_PACKAGE_kmod-crypto-aes=y
+CONFIG_PACKAGE_kmod-mtk-eth-hw-offload=y
+EOF
+
 ./scripts/feeds update -a && ./scripts/feeds install -a
 make defconfig
 
